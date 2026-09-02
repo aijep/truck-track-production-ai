@@ -1,78 +1,144 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
-import sqlite3
 import json
-from database import init_db
-from webhook_router import router as webhook_router
+import os
+from typing import List
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
 
-# Initialize SQLite database schema
-init_db()
+app = FastAPI(title="Logistics Truck Tracking API")
 
-app = FastAPI(title="Truck Tracking Logistics API")
+# Enable CORS for external client access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Mount Meta Webhook Endpoints
-app.include_router(webhook_router)
+# Environment Variables
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "my_custom_secret_token_123")
+META_WA_ACCESS_TOKEN = os.getenv("META_WA_ACCESS_TOKEN", "")
+META_WA_PHONE_NUMBER_ID = os.getenv("META_WA_PHONE_NUMBER_ID", "")
 
-# In-memory mapping: consignment_id -> List of WebSockets
-active_connections: dict[int, list[WebSocket]] = {}
 
-def update_truck_location(consignment_id: int, lat: float, lng: float):
-    with sqlite3.connect("logistics.db") as conn:
-        conn.execute(
-            "UPDATE consignments SET current_lat = ?, current_lng = ? WHERE id = ?",
-            (lat, lng, consignment_id)
-        )
+# -----------------------------------------------------------------------------
+# WebSocket Connection Manager
+# -----------------------------------------------------------------------------
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
 
-# Mobile Web Interface accessed via WhatsApp link
-@app.get("/track/{consignment_id}", response_class=HTMLResponse)
-def get_driver_tracker(consignment_id: int):
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Driver Navigation & GPS</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    </head>
-    <body style="font-family: sans-serif; text-align: center; padding: 20px;">
-        <h2>Trip #{consignment_id} Active</h2>
-        <p id="status">Connecting GPS...</p>
-        <script>
-            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const ws = new WebSocket(`${{wsProtocol}}//${{window.location.host}}/ws/location/{consignment_id}`);
-            
-            navigator.geolocation.watchPosition(
-                (pos) => {{
-                    const payload = {{ lat: pos.coords.latitude, lng: pos.coords.longitude }};
-                    ws.send(JSON.stringify(payload));
-                    document.getElementById('status').innerText = `Transmitting Location: ${{payload.lat.toFixed(4)}}, ${{payload.lng.toFixed(4)}}`;
-                }},
-                (err) => {{ document.getElementById('status').innerText = "Location Error: " + err.message; }},
-                {{ enableHighAccuracy: true }}
-            );
-        </script>
-    </body>
-    </html>
-    """
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
 
-# Real-time WebSocket Endpoint
-@app.websocket("/ws/location/{consignment_id}")
-async def websocket_location(websocket: WebSocket, consignment_id: int):
-    await websocket.accept()
-    if consignment_id not in active_connections:
-        active_connections[consignment_id] = []
-    active_connections[consignment_id].append(websocket)
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                pass
+
+
+manager = ConnectionManager()
+
+
+# -----------------------------------------------------------------------------
+# Frontend Routes
+# -----------------------------------------------------------------------------
+@app.get("/")
+async def get_dashboard():
+    """Serves the Leaflet/OpenStreetMap admin dashboard."""
+    if os.path.exists("index.html"):
+        return FileResponse("index.html")
+    return HTMLResponse("<h2>index.html not found in root directory.</h2>", status_code=404)
+
+
+# -----------------------------------------------------------------------------
+# Meta WhatsApp Webhook Endpoints
+# -----------------------------------------------------------------------------
+@app.get("/webhook")
+async def verify_webhook(
+    mode: str = Query(None, alias="hub.mode"),
+    token: str = Query(None, alias="hub.verify_token"),
+    challenge: str = Query(None, alias="hub.challenge"),
+):
+    """Handles the Meta verification handshake."""
+    if mode == "subscribe" and token == META_VERIFY_TOKEN:
+        return int(challenge) if challenge and challenge.isdigit() else challenge
+    raise HTTPException(status_code=403, detail="Verification failed: Invalid token or mode")
+
+
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    """Receives WhatsApp message status receipts and incoming driver updates."""
+    data = await request.json()
     
+    # Broadcast status updates to connected WebSocket clients
+    try:
+        entries = data.get("entry", [])
+        for entry in entries:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                statuses = value.get("statuses", [])
+                for status in statuses:
+                    msg_id = status.get("id")
+                    recipient_id = status.get("recipient_id")
+                    stat = status.get("status")
+                    await manager.broadcast({
+                        "type": "whatsapp_status",
+                        "message_id": msg_id,
+                        "recipient": recipient_id,
+                        "status": stat
+                    })
+    except Exception as e:
+        print(f"Error parsing webhook payload: {e}")
+
+    return {"status": "success"}
+
+
+# -----------------------------------------------------------------------------
+# Telemetry & Location Telemetry Endpoints
+# -----------------------------------------------------------------------------
+@app.post("/api/location")
+async def update_location(payload: dict):
+    """Receives GPS location updates from driver mobile interface."""
+    consignment_id = payload.get("consignment_id")
+    lat = payload.get("lat")
+    lng = payload.get("lng")
+    driver_name = payload.get("driver_name", "Driver")
+
+    if not consignment_id or lat is None or lng is None:
+        raise HTTPException(status_code=400, detail="Missing required tracking fields")
+
+    location_data = {
+        "type": "location_update",
+        "consignment_id": consignment_id,
+        "lat": float(lat),
+        "lng": float(lng),
+        "driver_name": driver_name
+    }
+
+    # Broadcast location to active dashboard WebSockets
+    await manager.broadcast(location_data)
+    return {"status": "location_updated", "data": location_data}
+
+
+# -----------------------------------------------------------------------------
+# Real-Time WebSocket Endpoint
+# -----------------------------------------------------------------------------
+@app.websocket("/ws/dashboard")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
     try:
         while True:
-            data_str = await websocket.receive_text()
-            data = json.loads(data_str)
-            lat, lng = data["lat"], data["lng"]
-            
-            update_truck_location(consignment_id, lat, lng)
-            
-            # Broadcast to dashboard interfaces tracking this consignment
-            for conn in active_connections.get(consignment_id, []):
-                if conn != websocket:
-                    await conn.send_json({"consignment_id": consignment_id, "lat": lat, "lng": lng})
+            # Keep connection open and receive optional ping messages
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        active_connections[consignment_id].remove(websocket)
+        manager.disconnect(websocket)
