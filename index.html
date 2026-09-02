@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Google Maps Live Logistics Tracking</title>
+  <script src="https://maps.googleapis.com/maps/api/js?key=YOUR_GOOGLE_MAPS_API_KEY"></script>
+  <style>#map { height: 100vh; width: 100%; }</style>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    let map, marker, directionsService, directionsRenderer;
+
+    function initMap() {
+      directionsService = new google.maps.DirectionsService();
+      directionsRenderer = new google.maps.DirectionsRenderer();
+      
+      const origin = { lat: 28.6139, lng: 77.2090 }; // Example Source (Delhi)
+      map = new google.maps.Map(document.getElementById("map"), { zoom: 7, center: origin });
+      directionsRenderer.setMap(map);
+      
+      // Truck Marker
+      marker = new google.maps.Marker({
+        map: map,
+        icon: "https://maps.google.com/mapfiles/kml/shapes/truck.png",
+        title: "Truck Live Location"
+      });
+
+      // Plot Planned Route
+      plotRoute("Delhi, India", "Mumbai, India");
+      
+      // Connect to FastAPI WebSocket for Live Location Stream
+      connectWebSocket(1); // Consignment ID = 1
+    }
+
+    function plotRoute(source, destination) {
+      directionsService.route(
+        { origin: source, destination: destination, travelMode: 'DRIVING' },
+        (response, status) => {
+          if (status === 'OK') directionsRenderer.setDirections(response);
+        }
+      );
+    }
+
+    function connectWebSocket(consignmentId) {
+      const ws = new WebSocket(`ws://localhost:8000/ws/location/${consignmentId}`);
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        const newPos = new google.maps.LatLng(data.lat, data.lng);
+        marker.setPosition(newPos);
+        map.panTo(newPos);
+      };
+    }
+
+    window.onload = initMap;
+  </script>
+</body>
+</html>
