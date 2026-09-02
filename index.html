@@ -1,57 +1,145 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>Google Maps Live Logistics Tracking</title>
-  <script src="https://maps.googleapis.com/maps/api/js?key=YOUR_GOOGLE_MAPS_API_KEY"></script>
-  <style>#map { height: 100vh; width: 100%; }</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Logistics - Truck Tracking Dashboard</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Leaflet CSS & JS (Free OpenStreetMap Engine) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <style>
+        #map { height: 100%; width: 100%; }
+    </style>
 </head>
-<body>
-  <div id="map"></div>
-  <script>
-    let map, marker, directionsService, directionsRenderer;
+<body class="bg-gray-900 text-white font-sans flex h-screen overflow-hidden">
 
-    function initMap() {
-      directionsService = new google.maps.DirectionsService();
-      directionsRenderer = new google.maps.DirectionsRenderer();
-      
-      const origin = { lat: 28.6139, lng: 77.2090 }; // Example Source (Delhi)
-      map = new google.maps.Map(document.getElementById("map"), { zoom: 7, center: origin });
-      directionsRenderer.setMap(map);
-      
-      // Truck Marker
-      marker = new google.maps.Marker({
-        map: map,
-        icon: "https://maps.google.com/mapfiles/kml/shapes/truck.png",
-        title: "Truck Live Location"
-      });
+    <!-- Sidebar -->
+    <aside class="w-96 bg-gray-800 border-r border-gray-700 flex flex-col z-10 shadow-lg">
+        <div class="p-4 border-b border-gray-700">
+            <h1 class="text-xl font-bold text-blue-400 flex items-center gap-2">
+                <span>🚛</span> Truck Tracker Admin
+            </h1>
+            <p class="text-xs text-gray-400 mt-1">Free OpenStreetMap Engine</p>
+        </div>
 
-      // Plot Planned Route
-      plotRoute("Delhi, India", "Mumbai, India");
-      
-      // Connect to FastAPI WebSocket for Live Location Stream
-      connectWebSocket(1); // Consignment ID = 1
-    }
+        <div class="px-4 py-2 bg-gray-750 flex items-center justify-between text-xs border-b border-gray-700">
+            <span class="text-gray-400">WebSocket Link:</span>
+            <span id="ws-status" class="px-2 py-0.5 rounded-full bg-yellow-500/20 text-yellow-400 font-semibold">Connecting...</span>
+        </div>
 
-    function plotRoute(source, destination) {
-      directionsService.route(
-        { origin: source, destination: destination, travelMode: 'DRIVING' },
-        (response, status) => {
-          if (status === 'OK') directionsRenderer.setDirections(response);
+        <div class="flex-1 overflow-y-auto p-4 space-y-3" id="truck-list">
+            <div id="no-trucks" class="text-center text-gray-500 py-8 text-sm">
+                Waiting for live truck coordinates...
+            </div>
+        </div>
+
+        <div class="h-48 border-t border-gray-700 bg-gray-900 p-3 flex flex-col">
+            <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">WhatsApp Webhook Events</h2>
+            <div id="logs" class="flex-1 overflow-y-auto text-xs font-mono space-y-1 text-gray-300">
+                <div class="text-gray-600 italic">[System] Listening for receipts...</div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Map Canvas -->
+    <main class="flex-1 relative bg-gray-950">
+        <div id="map"></div>
+    </main>
+
+    <script>
+        let map;
+        const markers = {};
+
+        // Initialize OpenStreetMap via Leaflet
+        function initMap() {
+            map = L.map('map').setView([20.5937, 78.9629], 5); // Default view
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
         }
-      );
-    }
 
-    function connectWebSocket(consignmentId) {
-      const ws = new WebSocket(`ws://localhost:8000/ws/location/${consignmentId}`);
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        const newPos = new google.maps.LatLng(data.lat, data.lng);
-        marker.setPosition(newPos);
-        map.panTo(newPos);
-      };
-    }
+        // Establish WebSocket Connection
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/dashboard`;
+        const socket = new WebSocket(wsUrl);
 
-    window.onload = initMap;
-  </script>
+        const statusBadge = document.getElementById("ws-status");
+        const truckList = document.getElementById("truck-list");
+        const logsContainer = document.getElementById("logs");
+
+        socket.onopen = () => {
+            statusBadge.textContent = "Live";
+            statusBadge.className = "px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 font-semibold";
+            logEvent("WebSocket connected.");
+        };
+
+        socket.onclose = () => {
+            statusBadge.textContent = "Disconnected";
+            statusBadge.className = "px-2 py-0.5 rounded-full bg-red-500/20 text-red-400 font-semibold";
+            logEvent("WebSocket closed.");
+        };
+
+        socket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data.type === "location_update") {
+                updateTruckMarker(data);
+            } else if (data.type === "whatsapp_status") {
+                logEvent(`WA Msg ${data.message_id}: ${data.status.toUpperCase()}`);
+            }
+        };
+
+        function updateTruckMarker(data) {
+            const { consignment_id, lat, lng, driver_name } = data;
+            const latitude = parseFloat(lat);
+            const longitude = parseFloat(lng);
+
+            const noTrucksEl = document.getElementById("no-trucks");
+            if (noTrucksEl) noTrucksEl.remove();
+
+            if (markers[consignment_id]) {
+                markers[consignment_id].setLatLng([latitude, longitude]);
+            } else {
+                markers[consignment_id] = L.marker([latitude, longitude])
+                    .addTo(map)
+                    .bindPopup(`<b>Driver: ${driver_name || consignment_id}</b><br>ID: ${consignment_id}`);
+                
+                map.setView([latitude, longitude], 13);
+            }
+
+            let card = document.getElementById(`truck-card-${consignment_id}`);
+            if (!card) {
+                card = document.createElement("div");
+                card.id = `truck-card-${consignment_id}`;
+                card.className = "p-3 bg-gray-750 border border-gray-700 rounded-lg cursor-pointer hover:border-blue-500";
+                card.onclick = () => map.setView([latitude, longitude], 14);
+                truckList.appendChild(card);
+            }
+
+            card.innerHTML = `
+                <div class="flex justify-between items-start">
+                    <span class="font-bold text-sm text-blue-300">ID: ${consignment_id}</span>
+                    <span class="text-xs bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded">Active</span>
+                </div>
+                <div class="text-xs text-gray-300 mt-1">Driver: ${driver_name || 'Assigned Driver'}</div>
+                <div class="text-xs text-gray-500 mt-0.5 font-mono">Lat: ${latitude.toFixed(4)}, Lng: ${longitude.toFixed(4)}</div>
+            `;
+        }
+
+        function logEvent(message) {
+            const entry = document.createElement("div");
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logsContainer.appendChild(entry);
+            logsContainer.scrollTop = logsContainer.scrollHeight;
+        }
+
+        window.onload = initMap;
+    </script>
 </body>
 </html>
